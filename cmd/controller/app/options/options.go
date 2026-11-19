@@ -27,6 +27,7 @@ import (
 	configv1alpha1 "github.com/cert-manager/cert-manager/pkg/apis/config/controller/v1alpha1"
 	shimgatewaycontroller "github.com/cert-manager/cert-manager/pkg/controller/certificate-shim/gateways"
 	listenersetcontroller "github.com/cert-manager/cert-manager/pkg/controller/certificate-shim/listenerset"
+	rotationcontroller "github.com/cert-manager/cert-manager/pkg/controller/certificaterotation"
 	logf "github.com/cert-manager/cert-manager/pkg/logs"
 	utilfeature "github.com/cert-manager/cert-manager/pkg/util/feature"
 	"github.com/spf13/pflag"
@@ -300,6 +301,11 @@ func EnabledControllers(o *config.ControllerConfiguration) sets.Set[string] {
 	if utilfeature.DefaultFeatureGate.Enabled(feature.ListenerSets) && o.GatewayAPIConfig.Enabled && o.GatewayAPIConfig.EnableListenerSet {
 		logf.Log.Info("enabling the sig-network Gateway API ListenerSet certificate-shim")
 		enabled = enabled.Insert(listenersetcontroller.ControllerName)
+	}
+
+	if utilfeature.DefaultFeatureGate.Enabled(feature.RotationAwareWorkloadReload) {
+		logf.Log.Info("enabling rotation-aware workload reload controller")
+		enabled = enabled.Insert(rotationcontroller.ControllerName)
 	}
 
 	if utilfeature.DefaultFeatureGate.Enabled(feature.ValidateCAA) {

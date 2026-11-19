@@ -124,6 +124,10 @@ func (bf *filteredSecretsFactory) Ingresses() networkingv1informers.IngressInfor
 	return bf.typedInformerFactory.Networking().V1().Ingresses()
 }
 
+func (bf *filteredSecretsFactory) Pods() corev1informers.PodInformer {
+	return bf.typedInformerFactory.Core().V1().Pods()
+}
+
 func (bf *filteredSecretsFactory) CertificateSigningRequests() certificatesv1.CertificateSigningRequestInformer {
 	return bf.typedInformerFactory.Certificates().V1().CertificateSigningRequests()
 }
@@ -225,6 +229,13 @@ func (sl *secretLister) Secrets(namespace string) corev1listers.SecretNamespaceL
 		typedClient:           sl.typedClient,
 		ctx:                   sl.ctx,
 	}
+}
+
+// List returns Secrets from the typed (full object) cache. Only Secrets
+// labelled for full caching are present there, which includes every
+// cert-manager certificate Secret.
+func (sl *secretLister) List(selector labels.Selector) ([]*corev1.Secret, error) {
+	return sl.typedLister.List(selector)
 }
 
 var _ corev1listers.SecretNamespaceLister = &secretNamespaceLister{}

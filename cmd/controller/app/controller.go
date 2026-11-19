@@ -252,6 +252,10 @@ func Run(rootCtx context.Context, opts *config.ControllerConfiguration) error {
 			}
 			return err
 		}
+		if iface == nil {
+			log.V(logf.InfoLevel).Info("controller opted out (feature gate disabled)")
+			continue
+		}
 
 		g.Go(func() error {
 			log.V(logf.InfoLevel).Info("starting controller")

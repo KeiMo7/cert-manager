@@ -217,6 +217,17 @@ const (
 	// Design: https://github.com/cert-manager/cert-manager/blob/master/design/20261007.mldsa-private-keys.md
 	// Github Issue: https://github.com/cert-manager/cert-manager/issues/8929
 	MLDSAPrivateKeys featuregate.Feature = "MLDSAPrivateKeys"
+
+	// Owner: cert-manager
+	// Alpha: v1.22
+	//
+	// RotationAwareWorkloadReload enables the certificate rotation controller
+	// that notifies every workload consuming a rotated certificate Secret and
+	// drives a configurable, connection-safe reload. The gate is off by
+	// default so existing deployments keep their current rotation behaviour;
+	// individual Secrets additionally opt in via the
+	// rotation.cert-manager.io/enabled annotation.
+	RotationAwareWorkloadReload featuregate.Feature = "RotationAwareWorkloadReload"
 )
 
 func init() {
@@ -245,6 +256,7 @@ var defaultCertManagerFeatureGates = map[featuregate.Feature]featuregate.Feature
 	ACMEHTTP01IngressPathTypeExact:                   {Default: true, PreRelease: featuregate.Beta},
 	ACMEUseARI:                                       {Default: false, PreRelease: featuregate.Alpha},
 	MLDSAPrivateKeys:                                 {Default: false, PreRelease: featuregate.Alpha},
+	RotationAwareWorkloadReload:                      {Default: false, PreRelease: featuregate.Alpha},
 
 	// NB: Deprecated + removed feature gates are kept here.
 	// `featuregate.Deprecated` exists, but will cause the featuregate library

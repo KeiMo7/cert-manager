@@ -240,6 +240,12 @@ func (m *Metrics) ACMERequestCounter() *prometheus.CounterVec {
 	return m.acmeClientRequestCount
 }
 
+// Registry exposes the Prometheus registry so controllers can register
+// feature-specific collectors alongside the shared metrics.
+func (m *Metrics) Registry() prometheus.Registerer {
+	return m.registry
+}
+
 // NewServer registers Prometheus metrics and returns a new Prometheus metrics HTTP server.
 func (m *Metrics) NewServer(ln net.Listener) *http.Server {
 	m.registry.MustRegister(m.clockTimeSeconds)

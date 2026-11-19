@@ -72,6 +72,10 @@ func (bf *baseFactory) Ingresses() networkingv1informers.IngressInformer {
 	return bf.f.Networking().V1().Ingresses()
 }
 
+func (bf *baseFactory) Pods() corev1informers.PodInformer {
+	return bf.f.Core().V1().Pods()
+}
+
 func (bf *baseFactory) Secrets() SecretInformer {
 	return &baseSecretInformer{
 		f:         bf.f,

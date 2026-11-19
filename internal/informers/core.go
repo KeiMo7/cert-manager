@@ -18,7 +18,9 @@ package informers
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	certificatesv1 "k8s.io/client-go/informers/certificates/v1"
+	corev1informers "k8s.io/client-go/informers/core/v1"
 	networkingv1informers "k8s.io/client-go/informers/networking/v1"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
@@ -46,6 +48,7 @@ type KubeInformerFactory interface {
 	WaitForCacheSync(<-chan struct{}) map[string]bool
 	Shutdown()
 	Ingresses() networkingv1informers.IngressInformer
+	Pods() corev1informers.PodInformer
 	Secrets() SecretInformer
 	CertificateSigningRequests() certificatesv1.CertificateSigningRequestInformer
 }
@@ -62,6 +65,8 @@ type SecretInformer interface {
 
 // SecretLister is a subset of client-go SecretLister functionality https://github.com/kubernetes/client-go/blob/release-1.26/listers/core/v1/secret.go#L28-L37
 type SecretLister interface {
+	// List lists Secrets across all namespaces matching the selector.
+	List(selector labels.Selector) ([]*corev1.Secret, error)
 	// Secrets returns a namespace secrets getter/lister
 	Secrets(namespace string) corev1listers.SecretNamespaceLister
 }

@@ -77,6 +77,10 @@ func (b *Builder) Complete() (Interface, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error registering controller: %v", err)
 	}
+	// A feature-gated controller may opt out of registration entirely.
+	if queue == nil {
+		return nil, nil
+	}
 
 	return NewController(b.name, controllerctx.Metrics, b.impl.ProcessItem, mustSync, b.runDurationFuncs, queue), nil
 }
