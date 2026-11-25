@@ -21,6 +21,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/clock"
 
+	"github.com/cert-manager/cert-manager/internal/controller/certificates/retry"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	acmeapi "github.com/cert-manager/cert-manager/third_party/forked/acme"
 )
@@ -86,6 +87,10 @@ func NewTriggerPolicyChain(c clock.Clock) Chain {
 
 // NewReadinessPolicyChain includes readiness policy checks, which if returns
 // true, would cause a Certificate to be marked as not ready.
+//
+// It keeps the original set of checks; callers that also want a Certificate
+// whose next issuance retry cannot complete before expiry to be reported as
+// not Ready should use NewReadinessPolicyChainWithRetry.
 func NewReadinessPolicyChain(c clock.Clock) Chain {
 	return Chain{
 		SecretDoesNotExist,     // Make sure the Secret exists
@@ -99,6 +104,28 @@ func NewReadinessPolicyChain(c clock.Clock) Chain {
 		SecretPublicKeyDiffersFromCurrentCertificateRequest, // Make sure the Secret's PublicKey matches the current CertificateRequest
 		CurrentCertificateRequestMismatchesSpec,             // Make sure the current CertificateRequest matches the Certificate spec
 		CurrentCertificateHasExpired(c),                     // Make sure the Certificate in the Secret has not expired
+	}
+}
+
+// NewReadinessPolicyChainWithRetry is like NewReadinessPolicyChain, but also
+// reports a Certificate as not Ready when its next issuance retry, computed
+// from the given backoff policy, cannot complete before the certificate in the
+// Secret expires. The retry check is appended after the expiry check so an
+// already expired certificate keeps reporting Expired.
+func NewReadinessPolicyChainWithRetry(c clock.Clock, policy retry.Policy) Chain {
+	return Chain{
+		SecretDoesNotExist,     // Make sure the Secret exists
+		SecretIsMissingData,    // Make sure the Secret has the required keys set
+		SecretPublicKeysDiffer, // Make sure the PrivateKey and PublicKey match in the Secret
+
+		SecretIssuerAnnotationsMismatch,          // Make sure the Secret's IssuerRef annotations match the Certificate spec
+		SecretCertificateNameAnnotationsMismatch, // Make sure the Secret's CertificateName annotation matches the Certificate's name
+
+		SecretPrivateKeyMismatchesSpec,                      // Make sure the PrivateKey Type and Size match the Certificate spec
+		SecretPublicKeyDiffersFromCurrentCertificateRequest, // Make sure the Secret's PublicKey matches the current CertificateRequest
+		CurrentCertificateRequestMismatchesSpec,             // Make sure the current CertificateRequest matches the Certificate spec
+		CurrentCertificateHasExpired(c),                     // Make sure the Certificate in the Secret has not expired
+		CurrentCertificateRetryExhausted(c, policy),         // Make sure the retry can complete before the Certificate expires
 	}
 }
 

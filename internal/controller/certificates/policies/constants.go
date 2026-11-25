@@ -53,6 +53,11 @@ const (
 	// Expired is a policy violation reason for a scenario where Certificate has
 	// expired.
 	Expired string = "Expired"
+	// RetryExhausted is a policy violation reason for a scenario where the next
+	// retry of a failed issuance is scheduled at or after the expiry of the
+	// certificate currently stored in the Secret, so the retry cannot complete
+	// before the certificate expires.
+	RetryExhausted string = "RetryExhausted"
 	// WindowError is a policy violation for a scenario where a time couldn't be
 	// found due to a cron misconfiguration or validation.
 	WindowError string = "WindowError"

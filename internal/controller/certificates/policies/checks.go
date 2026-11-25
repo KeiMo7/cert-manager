@@ -36,6 +36,7 @@ import (
 
 	cmmeta "github.com/cert-manager/cert-manager/internal/apis/meta"
 	internalcertificates "github.com/cert-manager/cert-manager/internal/controller/certificates"
+	"github.com/cert-manager/cert-manager/internal/controller/certificates/retry"
 	apiutil "github.com/cert-manager/cert-manager/pkg/api/util"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	"github.com/cert-manager/cert-manager/pkg/util/pki"
@@ -331,6 +332,61 @@ func CurrentCertificateHasExpired(c clock.Clock) Func {
 			return Expired, fmt.Sprintf("Certificate expired on %s", x509Cert.NotAfter.Format(time.RFC1123)), true
 		}
 		return "", "", false
+	}
+}
+
+// CurrentCertificateRetryExhausted reports a policy violation when the next
+// retry of a failed issuance is scheduled at or after the expiry of the
+// certificate currently stored in the Secret. In that case the retry cannot
+// complete before the certificate expires, so the Certificate is reported as
+// not Ready with the RetryExhausted reason.
+//
+// The check is a no-op when there is no failure recorded, when the policy is
+// invalid, or when the backoff has already elapsed: those cases are either
+// already covered by other checks or would block a retry that is still
+// useful.
+func CurrentCertificateRetryExhausted(c clock.Clock, policy retry.Policy) Func {
+	return func(input Input) (string, string, bool) {
+		if input.Certificate == nil || input.Secret == nil || input.Secret.Data == nil {
+			return "", "", false
+		}
+		if input.Certificate.Status.LastFailureTime == nil {
+			return "", "", false
+		}
+
+		x509Cert, err := pki.DecodeX509CertificateBytes(input.Secret.Data[corev1.TLSCertKey])
+		if err != nil {
+			// An undecodable certificate is reported by another check; do not
+			// add a second, misleading reason.
+			return "", "", false
+		}
+
+		state := retry.State{
+			LastFailure: input.Certificate.Status.LastFailureTime.Time,
+		}
+		if attempts := input.Certificate.Status.FailedIssuanceAttempts; attempts != nil {
+			state.Attempts = retry.AttemptsFromInt(*attempts)
+		}
+
+		decision, err := policy.Decide(c.Now(), state)
+		if err != nil {
+			// An invalid policy must never make a still valid certificate look
+			// unusable, so it is deliberately not translated into a violation.
+			return "", "", false
+		}
+		if !decision.Waiting {
+			return "", "", false
+		}
+
+		notAfter := x509Cert.NotAfter.UTC()
+		if decision.NextAttempt.Before(notAfter) {
+			return "", "", false
+		}
+
+		return RetryExhausted, fmt.Sprintf(
+			"Certificate is not Ready: the next retry at %s is not before the certificate expires at %s",
+			decision.NextAttempt.Format(time.RFC3339), notAfter.Format(time.RFC3339),
+		), true
 	}
 }
 

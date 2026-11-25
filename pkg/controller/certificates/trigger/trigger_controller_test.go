@@ -19,6 +19,7 @@ package trigger
 import (
 	"context"
 	"fmt"
+	"math"
 	"testing"
 	"time"
 
@@ -241,6 +242,46 @@ func Test_controller_ProcessItem(t *testing.T) {
 			},
 			wantShouldReissueCalled: false,
 			wantScheduled:           []time.Duration{time.Minute},
+		},
+		"should not touch status and schedule the remaining wait when a future lastFailureTime is backed off": {
+			existingCertificate: gen.Certificate("cert-1", gen.SetCertificateNamespace("testns"),
+				gen.SetCertificateUID("cert-1-uid"),
+				gen.SetCertificateRevision(1),
+				gen.SetCertificateDNSNames("example.com"),
+				gen.SetCertificateLastFailureTime(metav1.NewTime(fixedNow.Add(48*time.Hour))),
+				gen.SetCertificateIssuanceAttempts(new(2)),
+			),
+			wantDataForCertificateCalled: true,
+			mockDataForCertificateReturn: policies.Input{
+				NextRevisionRequest: createCertificateRequestOrPanic(gen.Certificate("cert-1", gen.SetCertificateNamespace("testns"),
+					gen.SetCertificateUID("cert-1-uid"),
+					gen.SetCertificateRevision(2),
+					gen.SetCertificateDNSNames("example.com"),
+				)),
+			},
+			wantShouldReissueCalled: false,
+			// One full 2h backoff period, measured from now, not from the
+			// future failure time.
+			wantScheduled: []time.Duration{2 * time.Hour},
+		},
+		"should not touch status and schedule the remaining wait for a huge attempt count": {
+			existingCertificate: gen.Certificate("cert-1", gen.SetCertificateNamespace("testns"),
+				gen.SetCertificateUID("cert-1-uid"),
+				gen.SetCertificateRevision(1),
+				gen.SetCertificateDNSNames("example.com"),
+				gen.SetCertificateLastFailureTime(metav1.NewTime(fixedNow.Add(-time.Hour))),
+				gen.SetCertificateIssuanceAttempts(new(math.MaxInt32)),
+			),
+			wantDataForCertificateCalled: true,
+			mockDataForCertificateReturn: policies.Input{
+				NextRevisionRequest: createCertificateRequestOrPanic(gen.Certificate("cert-1", gen.SetCertificateNamespace("testns"),
+					gen.SetCertificateUID("cert-1-uid"),
+					gen.SetCertificateRevision(2),
+					gen.SetCertificateDNSNames("example.com"),
+				)),
+			},
+			wantShouldReissueCalled: false,
+			wantScheduled:           []time.Duration{31 * time.Hour},
 		},
 		"should set Issuing=True when issuance failed once 59 minutes ago but cert and next CR are mismatched": {
 			existingCertificate: gen.Certificate("cert-1", gen.SetCertificateNamespace("testns"),
@@ -837,6 +878,89 @@ func Test_shouldBackoffReissuingOnFailure(t *testing.T) {
 			)),
 			wantBackoff: false,
 		},
+		// A spec change means the user fixed the bad configuration, so the
+		// backoff must not delay the retry.
+		"should not back off when the Certificate spec no longer matches the next CertificateRequest": {
+			givenCert: gen.Certificate("cert-1", gen.SetCertificateNamespace("testns"),
+				gen.SetCertificateUID("cert-1-uid"),
+				gen.SetCertificateRevision(1),
+				gen.SetCertificateDNSNames("changed.example.com"),
+				gen.SetCertificateLastFailureTime(metav1.NewTime(clock.Now())),
+				gen.SetCertificateIssuanceAttempts(new(3)),
+			),
+			givenNextCR: createCertificateRequestOrPanic(gen.Certificate("cert-1", gen.SetCertificateNamespace("testns"),
+				gen.SetCertificateUID("cert-1-uid"),
+				gen.SetCertificateRevision(1),
+				gen.SetCertificateDNSNames("example.com"),
+			)),
+			wantBackoff: false,
+		},
+		// Without a "next" CertificateRequest there is nothing to compare the
+		// spec against; the existing backoff semantics apply.
+		"should back off when the next CertificateRequest is nil": {
+			givenCert: gen.Certificate("cert-1", gen.SetCertificateNamespace("testns"),
+				gen.SetCertificateUID("cert-1-uid"),
+				gen.SetCertificateRevision(1),
+				gen.SetCertificateDNSNames("example.com"),
+				gen.SetCertificateLastFailureTime(metav1.NewTime(clock.Now())),
+				gen.SetCertificateIssuanceAttempts(new(2)),
+			),
+			givenNextCR: nil,
+			wantBackoff: true,
+			wantDelay:   2 * time.Hour,
+		},
+		// An undecodable CSR cannot prove the Certificate changed, so the
+		// existing behaviour is to not block the retry.
+		"should not back off when the next CertificateRequest cannot be decoded": {
+			givenCert: gen.Certificate("cert-1", gen.SetCertificateNamespace("testns"),
+				gen.SetCertificateUID("cert-1-uid"),
+				gen.SetCertificateRevision(1),
+				gen.SetCertificateDNSNames("example.com"),
+				gen.SetCertificateLastFailureTime(metav1.NewTime(clock.Now())),
+				gen.SetCertificateIssuanceAttempts(new(2)),
+			),
+			givenNextCR: &cmapi.CertificateRequest{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "testns", Name: "cr-1"},
+				Spec:       cmapi.CertificateRequestSpec{Request: []byte("not a CSR")},
+			},
+			wantBackoff: false,
+		},
+		// A manually patched, ridiculous attempt count must not overflow the
+		// delay calculation or return a negative wait.
+		"should cap at max backoff for math.MaxInt32 attempts": {
+			givenCert: gen.Certificate("cert-1", gen.SetCertificateNamespace("testns"),
+				gen.SetCertificateUID("cert-1-uid"),
+				gen.SetCertificateRevision(1),
+				gen.SetCertificateDNSNames("example.com"),
+				gen.SetCertificateLastFailureTime(metav1.NewTime(clock.Now())),
+				gen.SetCertificateIssuanceAttempts(new(math.MaxInt32)),
+			),
+			givenNextCR: createCertificateRequestOrPanic(gen.Certificate("cert-1", gen.SetCertificateNamespace("testns"),
+				gen.SetCertificateUID("cert-1-uid"),
+				gen.SetCertificateRevision(1),
+				gen.SetCertificateDNSNames("example.com"),
+			)),
+			wantBackoff: true,
+			wantDelay:   32 * time.Hour,
+		},
+		// A failure timestamp in the future must not push the retry further
+		// out than one full backoff period.
+		"should wait one full delay when lastFailureTime is in the future": {
+			givenCert: gen.Certificate("cert-1", gen.SetCertificateNamespace("testns"),
+				gen.SetCertificateUID("cert-1-uid"),
+				gen.SetCertificateRevision(1),
+				gen.SetCertificateDNSNames("example.com"),
+				gen.SetCertificateLastFailureTime(metav1.NewTime(clock.Now().Add(48*time.Hour))),
+				gen.SetCertificateIssuanceAttempts(new(2)),
+			),
+			givenNextCR: createCertificateRequestOrPanic(gen.Certificate("cert-1", gen.SetCertificateNamespace("testns"),
+				gen.SetCertificateUID("cert-1-uid"),
+				gen.SetCertificateRevision(1),
+				gen.SetCertificateDNSNames("example.com"),
+			)),
+			wantBackoff: true,
+			wantDelay:   2 * time.Hour,
+		},
 		// This scenario will happen if an issuance failed for a version of cert-manager that does not implement exponential backoff
 		"should back off from reissuing for 1 hour if there was a failed issuance, 0 minutes ago and issuance attempts is not set": {
 			givenCert: gen.Certificate("cert-1", gen.SetCertificateNamespace("testns"),
@@ -929,6 +1053,22 @@ func Test_shouldBackoffReissuingOnFailure(t *testing.T) {
 				gen.SetCertificateDNSNames("example.com"),
 			)),
 			wantBackoff: false,
+		},
+		"should not back off when the configured minimum backoff is not positive": {
+			givenCert: gen.Certificate("cert-1", gen.SetCertificateNamespace("testns"),
+				gen.SetCertificateUID("cert-1-uid"),
+				gen.SetCertificateRevision(1),
+				gen.SetCertificateDNSNames("example.com"),
+				gen.SetCertificateLastFailureTime(metav1.NewTime(clock.Now())),
+				gen.SetCertificateIssuanceAttempts(new(3)),
+			),
+			givenNextCR: createCertificateRequestOrPanic(gen.Certificate("cert-1", gen.SetCertificateNamespace("testns"),
+				gen.SetCertificateUID("cert-1-uid"),
+				gen.SetCertificateRevision(1),
+				gen.SetCertificateDNSNames("example.com"),
+			)),
+			backoffDuration: -time.Hour,
+			wantBackoff:     false,
 		},
 		"should not back off from reissuing if 1 issuance failed 16 minutes ago and custom back off is 15 minutes": {
 			givenCert: gen.Certificate("cert-1", gen.SetCertificateNamespace("testns"),
@@ -1033,4 +1173,36 @@ func Test_shouldBackoffReissuingOnFailure(t *testing.T) {
 			assert.Equal(t, test.wantDelay, gotDelay)
 		})
 	}
+}
+
+// Test_shouldBackoffReissuingOnFailure_AlreadyDue is a focused check that the
+// boundary "now equals the next retry time" is not a backoff: exactly one
+// delay after the failure the Certificate must be retried immediately.
+func Test_shouldBackoffReissuingOnFailure_AlreadyDue(t *testing.T) {
+	now := time.Date(2020, 11, 20, 16, 5, 0, 0, time.UTC)
+	clock := fakeclock.NewFakeClock(now)
+
+	crt := gen.Certificate("cert-1", gen.SetCertificateNamespace("testns"),
+		gen.SetCertificateUID("cert-1-uid"),
+		gen.SetCertificateRevision(1),
+		gen.SetCertificateDNSNames("example.com"),
+		gen.SetCertificateLastFailureTime(metav1.NewTime(now.Add(-2*time.Hour))),
+		gen.SetCertificateIssuanceAttempts(new(2)),
+	)
+	nextCR := testcrypto.MustCreateCryptoBundle(t, gen.Certificate("cert-1", gen.SetCertificateNamespace("testns"),
+		gen.SetCertificateUID("cert-1-uid"),
+		gen.SetCertificateRevision(1),
+		gen.SetCertificateDNSNames("example.com"),
+	), clock).CertificateRequest
+
+	backoff, delay := shouldBackoffReissuingOnFailure(testr.New(t), clock, crt, nextCR, time.Hour, 32*time.Hour)
+	assert.False(t, backoff, "exactly at the retry time the issuance must not be backed off")
+	assert.Zero(t, delay)
+
+	// One nanosecond before the retry time, the remaining wait is that
+	// nanosecond.
+	clock.SetTime(now.Add(-time.Nanosecond))
+	backoff, delay = shouldBackoffReissuingOnFailure(testr.New(t), clock, crt, nextCR, time.Hour, 32*time.Hour)
+	assert.True(t, backoff)
+	assert.Equal(t, time.Nanosecond, delay)
 }

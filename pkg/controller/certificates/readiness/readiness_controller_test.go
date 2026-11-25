@@ -29,23 +29,30 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	coretesting "k8s.io/client-go/testing"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	fakeclock "k8s.io/utils/clock/testing"
+	"k8s.io/utils/ptr"
 
 	"github.com/cert-manager/cert-manager/internal/controller/certificates/policies"
+	"github.com/cert-manager/cert-manager/internal/controller/certificates/retry"
 	"github.com/cert-manager/cert-manager/internal/controller/feature"
 	"github.com/cert-manager/cert-manager/internal/test/testutil"
 	accountstest "github.com/cert-manager/cert-manager/pkg/acme/accounts/test"
 	acmecl "github.com/cert-manager/cert-manager/pkg/acme/client"
+	apiutil "github.com/cert-manager/cert-manager/pkg/api/util"
 	cmacme "github.com/cert-manager/cert-manager/pkg/apis/acme/v1"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	testpkg "github.com/cert-manager/cert-manager/pkg/controller/test"
+	schedulertest "github.com/cert-manager/cert-manager/pkg/scheduler/test"
 	utilfeature "github.com/cert-manager/cert-manager/pkg/util/feature"
 	"github.com/cert-manager/cert-manager/pkg/util/pki"
 	testcrypto "github.com/cert-manager/cert-manager/test/unit/crypto"
@@ -1429,4 +1436,871 @@ func TestProcessItemARIRenewalTimePersistence(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestProcessItemRetryExhausted drives the real readiness policy chain (rather
+// than a stubbed evaluator) to check the interaction between a failed issuance
+// retry and the expiry of the certificate stored in the Secret.
+func TestProcessItemRetryExhausted(t *testing.T) {
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	privKey := testcrypto.MustCreatePEMPrivateKey(t)
+
+	readyMessage := "Certificate is up to date and has not expired"
+	// Three attempts back off for 4h, so the next retry is 07:04:05Z.
+	retryTime := now.Add(4 * time.Hour)
+
+	newCertificate := func(lastFailure time.Time) *cmapi.Certificate {
+		return gen.Certificate("test",
+			gen.SetCertificateNamespace("testns"),
+			gen.SetCertificateSecretName("test-secret"),
+			gen.SetCertificateCommonName("example.com"),
+			gen.SetCertificateGeneration(7),
+			gen.SetCertificateIssuer(cmmeta.IssuerReference{
+				Name:  "testissuer",
+				Kind:  "IssuerKind",
+				Group: "group.example.com",
+			}),
+			gen.SetCertificateLastFailureTime(metav1.NewTime(lastFailure)),
+			gen.SetCertificateIssuanceAttempts(new(3)),
+		)
+	}
+	newSecret := func(notBefore, notAfter time.Time) *corev1.Secret {
+		return gen.Secret("test-secret",
+			gen.SetSecretNamespace("testns"),
+			gen.SetSecretAnnotations(map[string]string{
+				cmapi.IssuerNameAnnotationKey:  "testissuer",
+				cmapi.IssuerKindAnnotationKey:  "IssuerKind",
+				cmapi.IssuerGroupAnnotationKey: "group.example.com",
+			}),
+			gen.SetSecretData(map[string][]byte{
+				corev1.TLSPrivateKeyKey: privKey,
+				corev1.TLSCertKey: testcrypto.MustCreateCertWithNotBeforeAfter(t, privKey,
+					gen.Certificate("test", gen.SetCertificateCommonName("example.com")),
+					notBefore, notAfter,
+				),
+			}),
+		)
+	}
+
+	tests := map[string]struct {
+		// notAfter is the expiry encoded into the certificate in the Secret.
+		// x509 stores seconds, so cases that need a sub-second offset shift
+		// lastFailure instead.
+		notAfter time.Time
+		// lastFailure is the failure time stamped on the Certificate.
+		lastFailure time.Time
+
+		wantStatus  cmmeta.ConditionStatus
+		wantReason  string
+		wantMessage string
+
+		wantEvents []string
+
+		// wantExpirySchedule, when non-nil, is the duration expected in the
+		// expiry work queue; when nil, Forget is expected instead.
+		wantExpirySchedule *time.Duration
+	}{
+		"Ready stays True while the next retry is before expiry": {
+			notAfter:           retryTime.Add(time.Second),
+			lastFailure:        now,
+			wantStatus:         cmmeta.ConditionTrue,
+			wantReason:         ReadyReason,
+			wantMessage:        readyMessage,
+			wantExpirySchedule: ptr.To(retryTime.Add(time.Second).Sub(now) + time.Second),
+		},
+		"Ready stays True when the next retry is one nanosecond before expiry": {
+			notAfter:    retryTime,
+			lastFailure: now.Add(-time.Nanosecond),
+			wantStatus:  cmmeta.ConditionTrue,
+			wantReason:  ReadyReason,
+			wantMessage: readyMessage,
+			// NextAttempt is 07:04:04.999999999Z, one nanosecond before the
+			// second-granular NotAfter of 07:04:05Z.
+			wantExpirySchedule: ptr.To(retryTime.Sub(now) + time.Second),
+		},
+		"not Ready with RetryExhausted when the next retry equals expiry": {
+			notAfter:    retryTime,
+			lastFailure: now,
+			wantStatus:  cmmeta.ConditionFalse,
+			wantReason:  policies.RetryExhausted,
+			wantMessage: "Certificate is not Ready: the next retry at 2026-01-02T07:04:05Z is not before the certificate expires at 2026-01-02T07:04:05Z",
+			wantEvents: []string{
+				"Warning RetryExhausted Certificate is not Ready: the next retry at 2026-01-02T07:04:05Z is not before the certificate expires at 2026-01-02T07:04:05Z",
+			},
+			wantExpirySchedule: ptr.To(retryTime.Sub(now) + time.Second),
+		},
+		"not Ready with RetryExhausted when the next retry is after expiry": {
+			notAfter:    retryTime.Add(-time.Second),
+			lastFailure: now,
+			wantStatus:  cmmeta.ConditionFalse,
+			wantReason:  policies.RetryExhausted,
+			wantMessage: "Certificate is not Ready: the next retry at 2026-01-02T07:04:05Z is not before the certificate expires at 2026-01-02T07:04:04Z",
+			wantEvents: []string{
+				"Warning RetryExhausted Certificate is not Ready: the next retry at 2026-01-02T07:04:05Z is not before the certificate expires at 2026-01-02T07:04:04Z",
+			},
+			wantExpirySchedule: ptr.To(retryTime.Add(-time.Second).Sub(now) + time.Second),
+		},
+		"an expired certificate reports Expired, not RetryExhausted": {
+			notAfter:    now.Add(-time.Hour),
+			lastFailure: now,
+			wantStatus:  cmmeta.ConditionFalse,
+			wantReason:  policies.Expired,
+			wantMessage: "Certificate expired on Fri, 02 Jan 2026 02:04:05 UTC",
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			crt := newCertificate(test.lastFailure)
+
+			builder := &testpkg.Builder{
+				T:                  t,
+				Clock:              fakeclock.NewFakeClock(now),
+				CertManagerObjects: []runtime.Object{crt},
+				KubeObjects:        []runtime.Object{newSecret(now.Add(-time.Hour), test.notAfter)},
+			}
+			builder.Init()
+			// The readiness chain is built from these options in Register, so
+			// they must be set before registration, as the real context does.
+			builder.CertificateOptions.CertificateRequestMinimumBackoffDuration = retry.DefaultMinimum
+			builder.CertificateOptions.CertificateRequestMaximumBackoffDuration = retry.DefaultMaximum
+			defer builder.Stop()
+
+			w := &controllerWrapper{}
+			if _, _, err := w.Register(builder.Context); err != nil {
+				t.Fatal(err)
+			}
+			w.controller.policyEvaluator = BuildReadyConditionFromChain
+			w.controller.recorder = builder.Recorder
+
+			var expirySchedule *time.Duration
+			var forgot bool
+			w.controller.expiryWorkQueue = &schedulertest.FakeScheduler{
+				AddFunc: func(_ types.NamespacedName, d time.Duration) {
+					expirySchedule = &d
+				},
+				ForgetFunc: func(types.NamespacedName) {
+					forgot = true
+					expirySchedule = nil
+				},
+			}
+
+			builder.Start()
+
+			key := types.NamespacedName{Namespace: crt.Namespace, Name: crt.Name}
+			if err := w.controller.ProcessItem(t.Context(), key); err != nil {
+				t.Fatalf("ProcessItem() error = %v", err)
+			}
+			// Wait for the fake client's status update to reach the informer
+			// cache before reading it back.
+			builder.Sync()
+
+			updated, err := builder.SharedInformerFactory.Certmanager().V1().Certificates().
+				Lister().Certificates(crt.Namespace).Get(crt.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ready := apiutil.GetCertificateCondition(updated, cmapi.CertificateConditionReady)
+			if ready == nil {
+				t.Fatal("Ready condition is missing")
+			}
+			assert.Equal(t, test.wantStatus, ready.Status)
+			assert.Equal(t, test.wantReason, ready.Reason)
+			assert.Equal(t, test.wantMessage, ready.Message)
+			assert.Equal(t, int64(7), ready.ObservedGeneration)
+			assert.Equal(t, updated.Generation, ready.ObservedGeneration)
+			assert.NotNil(t, ready.LastTransitionTime)
+
+			assert.Equal(t, test.wantEvents, builder.Events())
+			assert.Equal(t, test.wantExpirySchedule, expirySchedule)
+			if test.wantExpirySchedule == nil {
+				assert.True(t, forgot, "expiry check must be forgotten when the certificate is already expired")
+			}
+
+			// Only status writes are allowed; there must be no creates or
+			// deletes of other resources.
+			for _, action := range builder.FakeCMClient().Actions() {
+				if action.GetVerb() == "list" || action.GetVerb() == "watch" {
+					continue
+				}
+				assert.Equal(t, "update", action.GetVerb())
+				assert.Equal(t, "status", action.GetSubresource())
+			}
+		})
+	}
+}
+
+// TestProcessItemExpiryReschedule checks that the readiness controller
+// re-reconciles a Certificate when its certificate expires, so the Ready
+// condition cannot stay True without a new event.
+func TestProcessItemExpiryReschedule(t *testing.T) {
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	privKey := testcrypto.MustCreatePEMPrivateKey(t)
+
+	newSecret := func(notAfter time.Time) *corev1.Secret {
+		return gen.Secret("test-secret",
+			gen.SetSecretNamespace("testns"),
+			gen.SetSecretData(map[string][]byte{
+				corev1.TLSPrivateKeyKey: privKey,
+				corev1.TLSCertKey: testcrypto.MustCreateCertWithNotBeforeAfter(t, privKey,
+					gen.Certificate("test", gen.SetCertificateCommonName("example.com")),
+					now.Add(-time.Hour), notAfter,
+				),
+			}),
+		)
+	}
+	newCertificate := func(mods ...gen.CertificateModifier) *cmapi.Certificate {
+		base := gen.Certificate("test",
+			gen.SetCertificateNamespace("testns"),
+			gen.SetCertificateSecretName("test-secret"),
+			gen.SetCertificateCommonName("example.com"),
+		)
+		return gen.CertificateFrom(base, mods...)
+	}
+
+	tests := map[string]struct {
+		secret *corev1.Secret
+		crt    *cmapi.Certificate
+
+		wantAdd    *time.Duration
+		wantForget bool
+	}{
+		"future NotAfter schedules a check one second after expiry": {
+			secret:  newSecret(now.Add(2 * time.Hour)),
+			crt:     newCertificate(),
+			wantAdd: ptr.To(2*time.Hour + time.Second),
+		},
+		"expired certificate with Ready=True re-queues after one second": {
+			secret: newSecret(now.Add(-time.Hour)),
+			crt: newCertificate(gen.SetCertificateStatusCondition(cmapi.CertificateCondition{
+				Type:               cmapi.CertificateConditionReady,
+				Status:             cmmeta.ConditionTrue,
+				Reason:             ReadyReason,
+				LastTransitionTime: &metav1.Time{Time: now.Add(-2 * time.Hour)},
+			})),
+			wantAdd: ptr.To(time.Second),
+		},
+		"secret without a certificate forgets the expiry check": {
+			secret:     gen.Secret("test-secret", gen.SetSecretNamespace("testns")),
+			crt:        newCertificate(),
+			wantForget: true,
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			builder := &testpkg.Builder{
+				T:                  t,
+				Clock:              fakeclock.NewFakeClock(now),
+				CertManagerObjects: []runtime.Object{test.crt},
+				KubeObjects:        []runtime.Object{test.secret},
+			}
+			builder.Init()
+			defer builder.Stop()
+
+			w := &controllerWrapper{}
+			if _, _, err := w.Register(builder.Context); err != nil {
+				t.Fatal(err)
+			}
+			// Keep the computed condition True regardless of expiry, so the
+			// already-expired branch is exercised: the controller must notice
+			// the still-True condition and re-check instead of leaving it.
+			w.controller.policyEvaluator = policyEvaluatorBuilder(cmapi.CertificateCondition{
+				Type:    cmapi.CertificateConditionReady,
+				Status:  cmmeta.ConditionTrue,
+				Reason:  ReadyReason,
+				Message: "ready message",
+			})
+			w.controller.recorder = new(testpkg.FakeRecorder)
+
+			var add, forget int
+			var addDelay time.Duration
+			w.controller.expiryWorkQueue = &schedulertest.FakeScheduler{
+				AddFunc: func(_ types.NamespacedName, d time.Duration) {
+					add++
+					addDelay = d
+				},
+				ForgetFunc: func(types.NamespacedName) {
+					forget++
+				},
+			}
+
+			builder.Start()
+
+			key := types.NamespacedName{Namespace: test.crt.Namespace, Name: test.crt.Name}
+			if err := w.controller.ProcessItem(t.Context(), key); err != nil {
+				t.Fatalf("ProcessItem() error = %v", err)
+			}
+
+			if test.wantAdd != nil {
+				assert.Equal(t, 1, add, "expiry check adds")
+				assert.Equal(t, *test.wantAdd, addDelay)
+			} else {
+				assert.Zero(t, add, "expiry check adds")
+			}
+			if test.wantForget {
+				assert.GreaterOrEqual(t, forget, 1, "expiry check must be forgotten when there is no certificate")
+			}
+		})
+	}
+}
+
+// TestProcessItemRetryExhaustedEventOnce checks the RetryExhausted Warning is
+// emitted only on the transition into that state, not on every sync. The
+// builder's ExpectedEvents asserts the exact set of events fired.
+func TestProcessItemRetryExhaustedEventOnce(t *testing.T) {
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	privKey := testcrypto.MustCreatePEMPrivateKey(t)
+
+	crt := gen.Certificate("test",
+		gen.SetCertificateNamespace("testns"),
+		gen.SetCertificateSecretName("test-secret"),
+		gen.SetCertificateCommonName("example.com"),
+		gen.SetCertificateGeneration(6),
+		gen.SetCertificateIssuer(cmmeta.IssuerReference{
+			Name:  "testissuer",
+			Kind:  "IssuerKind",
+			Group: "group.example.com",
+		}),
+		gen.SetCertificateLastFailureTime(metav1.NewTime(now)),
+		gen.SetCertificateIssuanceAttempts(new(3)),
+	)
+	notAfter := now.Add(2 * time.Hour).Truncate(time.Second)
+	secret := gen.Secret("test-secret",
+		gen.SetSecretNamespace("testns"),
+		gen.SetSecretAnnotations(map[string]string{
+			cmapi.IssuerNameAnnotationKey:  "testissuer",
+			cmapi.IssuerKindAnnotationKey:  "IssuerKind",
+			cmapi.IssuerGroupAnnotationKey: "group.example.com",
+		}),
+		gen.SetSecretData(map[string][]byte{
+			corev1.TLSPrivateKeyKey: privKey,
+			corev1.TLSCertKey: testcrypto.MustCreateCertWithNotBeforeAfter(t, privKey,
+				gen.Certificate("test", gen.SetCertificateCommonName("example.com")),
+				now.Add(-time.Hour), notAfter,
+			),
+		}),
+	)
+
+	message := "Certificate is not Ready: the next retry at 2026-01-02T07:04:05Z is not before the certificate expires at 2026-01-02T05:04:05Z"
+
+	builder := &testpkg.Builder{
+		T:                  t,
+		Clock:              fakeclock.NewFakeClock(now),
+		CertManagerObjects: []runtime.Object{crt},
+		KubeObjects:        []runtime.Object{secret},
+		ExpectedEvents:     []string{"Warning RetryExhausted " + message},
+	}
+	builder.Init()
+	builder.CertificateOptions.CertificateRequestMinimumBackoffDuration = retry.DefaultMinimum
+	builder.CertificateOptions.CertificateRequestMaximumBackoffDuration = retry.DefaultMaximum
+	defer builder.Stop()
+
+	w := &controllerWrapper{}
+	if _, _, err := w.Register(builder.Context); err != nil {
+		t.Fatal(err)
+	}
+	w.controller.policyEvaluator = BuildReadyConditionFromChain
+	w.controller.recorder = builder.Recorder
+	w.controller.expiryWorkQueue = &schedulertest.FakeScheduler{
+		AddFunc:    func(types.NamespacedName, time.Duration) {},
+		ForgetFunc: func(types.NamespacedName) {},
+	}
+
+	// The status write must carry the RetryExhausted condition; match only the
+	// condition so the test does not depend on the renewal time calculation.
+	expectedCondition := cmapi.CertificateCondition{
+		Type:               cmapi.CertificateConditionReady,
+		Status:             cmmeta.ConditionFalse,
+		Reason:             policies.RetryExhausted,
+		Message:            message,
+		ObservedGeneration: crt.Generation,
+		LastTransitionTime: func() *metav1.Time { m := metav1.NewTime(now); return &m }(),
+	}
+	builder.ExpectedActions = append(builder.ExpectedActions,
+		testpkg.NewCustomMatch(
+			coretesting.NewUpdateSubresourceAction(
+				cmapi.SchemeGroupVersion.WithResource("certificates"),
+				"status",
+				crt.Namespace,
+				crt,
+			),
+			func(expected, actual coretesting.Action) error {
+				updated := actual.(coretesting.UpdateAction).GetObject().(*cmapi.Certificate)
+				cond := apiutil.GetCertificateCondition(updated, cmapi.CertificateConditionReady)
+				if cond == nil {
+					return errors.New("expected a Ready condition on the updated Certificate")
+				}
+				if diff := cmp.Diff(expectedCondition, *cond, cmpopts.IgnoreFields(cmapi.CertificateCondition{}, "LastTransitionTime")); diff != "" {
+					return fmt.Errorf("unexpected Ready condition (-want +got):\n%s", diff)
+				}
+				if cond.LastTransitionTime == nil || !cond.LastTransitionTime.Time.Equal(expectedCondition.LastTransitionTime.Time) {
+					return fmt.Errorf("unexpected LastTransitionTime: got %v, want %v", cond.LastTransitionTime, expectedCondition.LastTransitionTime)
+				}
+				return nil
+			},
+		),
+	)
+
+	builder.Start()
+
+	key := types.NamespacedName{Namespace: crt.Namespace, Name: crt.Name}
+	if err := w.controller.ProcessItem(t.Context(), key); err != nil {
+		t.Fatalf("ProcessItem() error = %v", err)
+	}
+	// Wait for the status update to reach the informer cache, so the second
+	// sync sees the RetryExhausted condition already recorded.
+	builder.Sync()
+	if err := w.controller.ProcessItem(t.Context(), key); err != nil {
+		t.Fatalf("ProcessItem() error = %v", err)
+	}
+
+	// CheckAndFinish fails on a second Warning and on any unexpected status
+	// write.
+	builder.CheckAndFinish()
+}
+
+// TestProcessItemRetryExhaustedCrossesExpiry checks that once the certificate
+// in the Secret actually expires, the Ready reason moves from RetryExhausted to
+// Expired while the status stays False and the transition time is preserved.
+func TestProcessItemRetryExhaustedCrossesExpiry(t *testing.T) {
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	privKey := testcrypto.MustCreatePEMPrivateKey(t)
+
+	notAfter := now.Add(2 * time.Hour)
+	transition := metav1.NewTime(now.Add(-time.Hour))
+
+	crt := gen.Certificate("test",
+		gen.SetCertificateNamespace("testns"),
+		gen.SetCertificateSecretName("test-secret"),
+		gen.SetCertificateCommonName("example.com"),
+		gen.SetCertificateIssuer(cmmeta.IssuerReference{
+			Name:  "testissuer",
+			Kind:  "IssuerKind",
+			Group: "group.example.com",
+		}),
+		gen.SetCertificateLastFailureTime(metav1.NewTime(now)),
+		gen.SetCertificateIssuanceAttempts(new(3)),
+		gen.SetCertificateStatusCondition(cmapi.CertificateCondition{
+			Type:               cmapi.CertificateConditionReady,
+			Status:             cmmeta.ConditionFalse,
+			Reason:             policies.RetryExhausted,
+			Message:            "previous",
+			LastTransitionTime: &transition,
+		}),
+	)
+	secret := gen.Secret("test-secret",
+		gen.SetSecretNamespace("testns"),
+		gen.SetSecretAnnotations(map[string]string{
+			cmapi.IssuerNameAnnotationKey:  "testissuer",
+			cmapi.IssuerKindAnnotationKey:  "IssuerKind",
+			cmapi.IssuerGroupAnnotationKey: "group.example.com",
+		}),
+		gen.SetSecretData(map[string][]byte{
+			corev1.TLSPrivateKeyKey: privKey,
+			corev1.TLSCertKey: testcrypto.MustCreateCertWithNotBeforeAfter(t, privKey,
+				gen.Certificate("test", gen.SetCertificateCommonName("example.com")),
+				now.Add(-time.Hour), notAfter,
+			),
+		}),
+	)
+
+	clock := fakeclock.NewFakeClock(now)
+	builder := &testpkg.Builder{
+		T:                  t,
+		Clock:              clock,
+		CertManagerObjects: []runtime.Object{crt},
+		KubeObjects:        []runtime.Object{secret},
+	}
+	builder.Init()
+	builder.CertificateOptions.CertificateRequestMinimumBackoffDuration = retry.DefaultMinimum
+	builder.CertificateOptions.CertificateRequestMaximumBackoffDuration = retry.DefaultMaximum
+	defer builder.Stop()
+
+	w := &controllerWrapper{}
+	if _, _, err := w.Register(builder.Context); err != nil {
+		t.Fatal(err)
+	}
+	w.controller.policyEvaluator = BuildReadyConditionFromChain
+	w.controller.recorder = builder.Recorder
+	w.controller.expiryWorkQueue = &schedulertest.FakeScheduler{
+		AddFunc:    func(types.NamespacedName, time.Duration) {},
+		ForgetFunc: func(types.NamespacedName) {},
+	}
+
+	builder.Start()
+
+	key := types.NamespacedName{Namespace: crt.Namespace, Name: crt.Name}
+	if err := w.controller.ProcessItem(t.Context(), key); err != nil {
+		t.Fatalf("ProcessItem() error = %v", err)
+	}
+	builder.Sync()
+
+	readReady := func() *cmapi.CertificateCondition {
+		t.Helper()
+		updated, err := builder.SharedInformerFactory.Certmanager().V1().Certificates().
+			Lister().Certificates(crt.Namespace).Get(crt.Name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ready := apiutil.GetCertificateCondition(updated, cmapi.CertificateConditionReady)
+		if ready == nil {
+			t.Fatal("Ready condition is missing")
+		}
+		return ready
+	}
+
+	before := readReady()
+	assert.Equal(t, policies.RetryExhausted, before.Reason)
+	assert.Equal(t, cmmeta.ConditionFalse, before.Status)
+	assert.Equal(t, transition, *before.LastTransitionTime)
+
+	// Move past NotAfter. The next reconcile is the one the expiry queue would
+	// have scheduled.
+	clock.SetTime(notAfter.Add(time.Second))
+	if err := w.controller.ProcessItem(t.Context(), key); err != nil {
+		t.Fatalf("ProcessItem() error = %v", err)
+	}
+	builder.Sync()
+
+	after := readReady()
+	assert.Equal(t, policies.Expired, after.Reason, "reason must move from RetryExhausted to Expired")
+	assert.Equal(t, cmmeta.ConditionFalse, after.Status, "the status stays False")
+	assert.Equal(t, transition, *after.LastTransitionTime, "a False-to-False change keeps the transition time")
+}
+
+// TestProcessItemSecretReplaced checks that a Secret replaced out of band is
+// re-read: the status dates follow the new certificate and the Ready condition
+// is recomputed from it.
+func TestProcessItemSecretReplaced(t *testing.T) {
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	privKey := testcrypto.MustCreatePEMPrivateKey(t)
+
+	newCertificate := func(staleNotAfter *metav1.Time) *cmapi.Certificate {
+		return gen.Certificate("test",
+			gen.SetCertificateNamespace("testns"),
+			gen.SetCertificateSecretName("test-secret"),
+			gen.SetCertificateCommonName("example.com"),
+			gen.SetCertificateIssuer(cmmeta.IssuerReference{
+				Name:  "testissuer",
+				Kind:  "IssuerKind",
+				Group: "group.example.com",
+			}),
+			gen.SetCertificateNotAfter(*staleNotAfter),
+			gen.SetCertificateNotBefore(metav1.NewTime(now.Add(-48*time.Hour))),
+			gen.SetCertificateRenewalTime(metav1.NewTime(now.Add(-time.Hour))),
+		)
+	}
+	newSecret := func(notAfter time.Time) *corev1.Secret {
+		return gen.Secret("test-secret",
+			gen.SetSecretNamespace("testns"),
+			gen.SetSecretAnnotations(map[string]string{
+				cmapi.IssuerNameAnnotationKey:  "testissuer",
+				cmapi.IssuerKindAnnotationKey:  "IssuerKind",
+				cmapi.IssuerGroupAnnotationKey: "group.example.com",
+			}),
+			gen.SetSecretData(map[string][]byte{
+				corev1.TLSPrivateKeyKey: privKey,
+				corev1.TLSCertKey: testcrypto.MustCreateCertWithNotBeforeAfter(t, privKey,
+					gen.Certificate("test", gen.SetCertificateCommonName("example.com")),
+					now.Add(-time.Hour), notAfter,
+				),
+			}),
+		)
+	}
+
+	staleNotAfter := metav1.NewTime(now.Add(-time.Hour))
+	crt := newCertificate(&staleNotAfter)
+	// The Secret holds a fresh certificate that does not match the stale
+	// status.notAfter.
+	freshNotAfter := now.Add(48 * time.Hour).Truncate(time.Second)
+
+	builder := &testpkg.Builder{
+		T:                  t,
+		Clock:              fakeclock.NewFakeClock(now),
+		CertManagerObjects: []runtime.Object{crt},
+		KubeObjects:        []runtime.Object{newSecret(freshNotAfter)},
+	}
+	builder.Init()
+	builder.CertificateOptions.CertificateRequestMinimumBackoffDuration = retry.DefaultMinimum
+	builder.CertificateOptions.CertificateRequestMaximumBackoffDuration = retry.DefaultMaximum
+	defer builder.Stop()
+
+	w := &controllerWrapper{}
+	if _, _, err := w.Register(builder.Context); err != nil {
+		t.Fatal(err)
+	}
+	w.controller.policyEvaluator = BuildReadyConditionFromChain
+	w.controller.recorder = builder.Recorder
+	w.controller.expiryWorkQueue = &schedulertest.FakeScheduler{
+		AddFunc:    func(types.NamespacedName, time.Duration) {},
+		ForgetFunc: func(types.NamespacedName) {},
+	}
+
+	builder.Start()
+
+	key := types.NamespacedName{Namespace: crt.Namespace, Name: crt.Name}
+	if err := w.controller.ProcessItem(t.Context(), key); err != nil {
+		t.Fatalf("ProcessItem() error = %v", err)
+	}
+	builder.Sync()
+
+	updated, err := builder.SharedInformerFactory.Certmanager().V1().Certificates().
+		Lister().Certificates(crt.Namespace).Get(crt.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.NotAfter == nil || updated.Status.NotBefore == nil || updated.Status.RenewalTime == nil {
+		t.Fatalf("status dates were not refreshed: %#v", updated.Status)
+	}
+	assert.Equal(t, freshNotAfter, updated.Status.NotAfter.Time)
+	assert.Equal(t, now.Add(-time.Hour), updated.Status.NotBefore.Time)
+	// Renewal time is recalculated from the certificate in the Secret, so the
+	// stale value in status must be replaced.
+	assert.NotEqual(t, now.Add(-time.Hour), updated.Status.RenewalTime.Time)
+
+	ready := apiutil.GetCertificateCondition(updated, cmapi.CertificateConditionReady)
+	if ready == nil {
+		t.Fatal("Ready condition is missing")
+	}
+	assert.Equal(t, cmmeta.ConditionTrue, ready.Status)
+}
+
+// TestProcessItemInvalidCertificateClearsDates checks that an undecodable
+// certificate in the Secret clears the cached dates and reports
+// InvalidCertificate rather than keeping stale status.
+func TestProcessItemInvalidCertificateClearsDates(t *testing.T) {
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	privKey := testcrypto.MustCreatePEMPrivateKey(t)
+
+	crt := gen.Certificate("test",
+		gen.SetCertificateNamespace("testns"),
+		gen.SetCertificateSecretName("test-secret"),
+		gen.SetCertificateCommonName("example.com"),
+		gen.SetCertificateIssuer(cmmeta.IssuerReference{
+			Name:  "testissuer",
+			Kind:  "IssuerKind",
+			Group: "group.example.com",
+		}),
+		gen.SetCertificateNotBefore(metav1.NewTime(now.Add(-time.Hour))),
+		gen.SetCertificateNotAfter(metav1.NewTime(now.Add(48*time.Hour))),
+		gen.SetCertificateRenewalTime(metav1.NewTime(now.Add(24*time.Hour))),
+	)
+	secret := gen.Secret("test-secret",
+		gen.SetSecretNamespace("testns"),
+		gen.SetSecretAnnotations(map[string]string{
+			cmapi.IssuerNameAnnotationKey:  "testissuer",
+			cmapi.IssuerKindAnnotationKey:  "IssuerKind",
+			cmapi.IssuerGroupAnnotationKey: "group.example.com",
+		}),
+		gen.SetSecretData(map[string][]byte{
+			corev1.TLSPrivateKeyKey: privKey,
+			corev1.TLSCertKey:       []byte("not a certificate"),
+		}),
+	)
+
+	builder := &testpkg.Builder{
+		T:                  t,
+		Clock:              fakeclock.NewFakeClock(now),
+		CertManagerObjects: []runtime.Object{crt},
+		KubeObjects:        []runtime.Object{secret},
+	}
+	builder.Init()
+	builder.CertificateOptions.CertificateRequestMinimumBackoffDuration = retry.DefaultMinimum
+	builder.CertificateOptions.CertificateRequestMaximumBackoffDuration = retry.DefaultMaximum
+	defer builder.Stop()
+
+	w := &controllerWrapper{}
+	if _, _, err := w.Register(builder.Context); err != nil {
+		t.Fatal(err)
+	}
+	w.controller.policyEvaluator = BuildReadyConditionFromChain
+	w.controller.recorder = builder.Recorder
+	w.controller.expiryWorkQueue = &schedulertest.FakeScheduler{
+		AddFunc:    func(types.NamespacedName, time.Duration) {},
+		ForgetFunc: func(types.NamespacedName) {},
+	}
+
+	builder.Start()
+
+	key := types.NamespacedName{Namespace: crt.Namespace, Name: crt.Name}
+	if err := w.controller.ProcessItem(t.Context(), key); err != nil {
+		t.Fatalf("ProcessItem() error = %v", err)
+	}
+	builder.Sync()
+
+	updated, err := builder.SharedInformerFactory.Certmanager().V1().Certificates().
+		Lister().Certificates(crt.Namespace).Get(crt.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assert.Nil(t, updated.Status.NotAfter)
+	assert.Nil(t, updated.Status.NotBefore)
+	assert.Nil(t, updated.Status.RenewalTime)
+
+	ready := apiutil.GetCertificateCondition(updated, cmapi.CertificateConditionReady)
+	if ready == nil {
+		t.Fatal("Ready condition is missing")
+	}
+	assert.Equal(t, cmmeta.ConditionFalse, ready.Status)
+	assert.Equal(t, policies.InvalidCertificate, ready.Reason)
+}
+
+// TestProcessItemRetryExhaustedConflictNoEvent checks that a conflict on the
+// status write is returned to the workqueue and does not emit the Warning; the
+// event is only produced once the state has actually been persisted.
+func TestProcessItemRetryExhaustedConflictNoEvent(t *testing.T) {
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	privKey := testcrypto.MustCreatePEMPrivateKey(t)
+
+	crt := gen.Certificate("test",
+		gen.SetCertificateNamespace("testns"),
+		gen.SetCertificateSecretName("test-secret"),
+		gen.SetCertificateCommonName("example.com"),
+		gen.SetCertificateIssuer(cmmeta.IssuerReference{
+			Name:  "testissuer",
+			Kind:  "IssuerKind",
+			Group: "group.example.com",
+		}),
+		gen.SetCertificateLastFailureTime(metav1.NewTime(now)),
+		gen.SetCertificateIssuanceAttempts(new(3)),
+	)
+	secret := gen.Secret("test-secret",
+		gen.SetSecretNamespace("testns"),
+		gen.SetSecretAnnotations(map[string]string{
+			cmapi.IssuerNameAnnotationKey:  "testissuer",
+			cmapi.IssuerKindAnnotationKey:  "IssuerKind",
+			cmapi.IssuerGroupAnnotationKey: "group.example.com",
+		}),
+		gen.SetSecretData(map[string][]byte{
+			corev1.TLSPrivateKeyKey: privKey,
+			corev1.TLSCertKey: testcrypto.MustCreateCertWithNotBeforeAfter(t, privKey,
+				gen.Certificate("test", gen.SetCertificateCommonName("example.com")),
+				now.Add(-time.Hour), now.Add(2*time.Hour),
+			),
+		}),
+	)
+
+	builder := &testpkg.Builder{
+		T:                  t,
+		Clock:              fakeclock.NewFakeClock(now),
+		CertManagerObjects: []runtime.Object{crt},
+		KubeObjects:        []runtime.Object{secret},
+	}
+	builder.Init()
+	builder.CertificateOptions.CertificateRequestMinimumBackoffDuration = retry.DefaultMinimum
+	builder.CertificateOptions.CertificateRequestMaximumBackoffDuration = retry.DefaultMaximum
+	defer builder.Stop()
+
+	recorder := new(testpkg.FakeRecorder)
+	w := &controllerWrapper{}
+	if _, _, err := w.Register(builder.Context); err != nil {
+		t.Fatal(err)
+	}
+	w.controller.policyEvaluator = BuildReadyConditionFromChain
+	w.controller.recorder = recorder
+	w.controller.expiryWorkQueue = &schedulertest.FakeScheduler{
+		AddFunc:    func(types.NamespacedName, time.Duration) {},
+		ForgetFunc: func(types.NamespacedName) {},
+	}
+
+	builder.FakeCMClient().PrependReactor("update", "certificates", func(coretesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewConflict(cmapi.Resource("certificates"), crt.Name, errors.New("simulated conflict"))
+	})
+
+	builder.Start()
+
+	key := types.NamespacedName{Namespace: crt.Namespace, Name: crt.Name}
+	err := w.controller.ProcessItem(t.Context(), key)
+	require.Error(t, err)
+	assert.True(t, apierrors.IsConflict(err), "the conflict must reach the workqueue, got %v", err)
+	assert.Empty(t, recorder.Events, "no event may be emitted before the state is persisted")
+}
+
+// TestProcessItemIssuingInProgressKeepsReady checks that an issuance in
+// progress does not make Ready False when the certificate already in the
+// Secret is still valid.
+func TestProcessItemIssuingInProgressKeepsReady(t *testing.T) {
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	privKey := testcrypto.MustCreatePEMPrivateKey(t)
+
+	crt := gen.Certificate("test",
+		gen.SetCertificateNamespace("testns"),
+		gen.SetCertificateSecretName("test-secret"),
+		gen.SetCertificateCommonName("example.com"),
+		gen.SetCertificateIssuer(cmmeta.IssuerReference{
+			Name:  "testissuer",
+			Kind:  "IssuerKind",
+			Group: "group.example.com",
+		}),
+		gen.SetCertificateStatusCondition(cmapi.CertificateCondition{
+			Type:               cmapi.CertificateConditionIssuing,
+			Status:             cmmeta.ConditionTrue,
+			Reason:             "Renewing",
+			Message:            "Renewing certificate as renewal was scheduled",
+			LastTransitionTime: &metav1.Time{Time: now},
+		}),
+	)
+	secret := gen.Secret("test-secret",
+		gen.SetSecretNamespace("testns"),
+		gen.SetSecretAnnotations(map[string]string{
+			cmapi.IssuerNameAnnotationKey:  "testissuer",
+			cmapi.IssuerKindAnnotationKey:  "IssuerKind",
+			cmapi.IssuerGroupAnnotationKey: "group.example.com",
+		}),
+		gen.SetSecretData(map[string][]byte{
+			corev1.TLSPrivateKeyKey: privKey,
+			corev1.TLSCertKey: testcrypto.MustCreateCertWithNotBeforeAfter(t, privKey,
+				gen.Certificate("test", gen.SetCertificateCommonName("example.com")),
+				now.Add(-time.Hour), now.Add(48*time.Hour),
+			),
+		}),
+	)
+
+	builder := &testpkg.Builder{
+		T:                  t,
+		Clock:              fakeclock.NewFakeClock(now),
+		CertManagerObjects: []runtime.Object{crt},
+		KubeObjects:        []runtime.Object{secret},
+	}
+	builder.Init()
+	builder.CertificateOptions.CertificateRequestMinimumBackoffDuration = retry.DefaultMinimum
+	builder.CertificateOptions.CertificateRequestMaximumBackoffDuration = retry.DefaultMaximum
+	defer builder.Stop()
+
+	w := &controllerWrapper{}
+	if _, _, err := w.Register(builder.Context); err != nil {
+		t.Fatal(err)
+	}
+	w.controller.policyEvaluator = BuildReadyConditionFromChain
+	w.controller.recorder = builder.Recorder
+	w.controller.expiryWorkQueue = &schedulertest.FakeScheduler{
+		AddFunc:    func(types.NamespacedName, time.Duration) {},
+		ForgetFunc: func(types.NamespacedName) {},
+	}
+
+	builder.Start()
+
+	key := types.NamespacedName{Namespace: crt.Namespace, Name: crt.Name}
+	if err := w.controller.ProcessItem(t.Context(), key); err != nil {
+		t.Fatalf("ProcessItem() error = %v", err)
+	}
+	builder.Sync()
+
+	updated, err := builder.SharedInformerFactory.Certmanager().V1().Certificates().
+		Lister().Certificates(crt.Namespace).Get(crt.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready := apiutil.GetCertificateCondition(updated, cmapi.CertificateConditionReady)
+	if ready == nil {
+		t.Fatal("Ready condition is missing")
+	}
+	assert.Equal(t, cmmeta.ConditionTrue, ready.Status)
+	assert.Equal(t, ReadyReason, ready.Reason)
+
+	// The Issuing condition must be left untouched by readiness.
+	issuing := apiutil.GetCertificateCondition(updated, cmapi.CertificateConditionIssuing)
+	require.NotNil(t, issuing)
+	assert.Equal(t, cmmeta.ConditionTrue, issuing.Status)
 }

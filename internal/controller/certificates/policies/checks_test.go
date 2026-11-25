@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	fakeclock "k8s.io/utils/clock/testing"
 
+	"github.com/cert-manager/cert-manager/internal/controller/certificates/retry"
 	"github.com/cert-manager/cert-manager/internal/pem"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
@@ -2394,4 +2395,162 @@ func Test_SecretCertificateNameAnnotationsMismatch(t *testing.T) {
 			assert.Equal(t, test.expViolation, gotViolation)
 		})
 	}
+}
+
+func Test_CurrentCertificateRetryExhausted(t *testing.T) {
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	clock := fakeclock.NewFakeClock(now)
+	privKey := testcrypto.MustCreatePEMPrivateKey(t)
+	policy := retry.Policy{Minimum: retry.DefaultMinimum, Maximum: retry.DefaultMaximum}
+
+	certWithNotAfter := func(notAfter time.Time) []byte {
+		return testcrypto.MustCreateCertWithNotBeforeAfter(t, privKey,
+			gen.Certificate("test", gen.SetCertificateCommonName("example.com")),
+			now.Add(-24*time.Hour), notAfter,
+		)
+	}
+	secret := func(certData []byte) *corev1.Secret {
+		return &corev1.Secret{Data: map[string][]byte{
+			corev1.TLSPrivateKeyKey: privKey,
+			corev1.TLSCertKey:       certData,
+		}}
+	}
+
+	tests := map[string]struct {
+		certificate *cmapi.Certificate
+		secret      *corev1.Secret
+		policy      retry.Policy
+
+		wantReason    string
+		wantMessage   string
+		wantViolation bool
+	}{
+		"no violation without a recorded failure": {
+			certificate: gen.Certificate("test"),
+			secret:      secret(certWithNotAfter(now.Add(2 * time.Hour))),
+			policy:      policy,
+		},
+		"no violation when the next retry is before expiry": {
+			certificate: gen.Certificate("test",
+				gen.SetCertificateLastFailureTime(metav1.NewTime(now)),
+				gen.SetCertificateIssuanceAttempts(new(1)),
+			),
+			secret: secret(certWithNotAfter(now.Add(2 * time.Hour))),
+			policy: policy,
+		},
+		"violation when the next retry is exactly at expiry": {
+			certificate: gen.Certificate("test",
+				gen.SetCertificateLastFailureTime(metav1.NewTime(now)),
+				gen.SetCertificateIssuanceAttempts(new(2)),
+			),
+			secret:        secret(certWithNotAfter(now.Add(2 * time.Hour))),
+			policy:        policy,
+			wantReason:    RetryExhausted,
+			wantMessage:   "Certificate is not Ready: the next retry at 2026-01-02T05:04:05Z is not before the certificate expires at 2026-01-02T05:04:05Z",
+			wantViolation: true,
+		},
+		"violation when the next retry is after expiry": {
+			certificate: gen.Certificate("test",
+				gen.SetCertificateLastFailureTime(metav1.NewTime(now)),
+				gen.SetCertificateIssuanceAttempts(new(3)),
+			),
+			secret:        secret(certWithNotAfter(now.Add(3 * time.Hour))),
+			policy:        policy,
+			wantReason:    RetryExhausted,
+			wantMessage:   "Certificate is not Ready: the next retry at 2026-01-02T07:04:05Z is not before the certificate expires at 2026-01-02T06:04:05Z",
+			wantViolation: true,
+		},
+		"no violation when attempts are nil and the minimum still fits before expiry": {
+			certificate: gen.Certificate("test",
+				gen.SetCertificateLastFailureTime(metav1.NewTime(now)),
+			),
+			secret: secret(certWithNotAfter(now.Add(2 * time.Hour))),
+			policy: policy,
+		},
+		"no violation when lastFailureTime is nil": {
+			certificate: gen.Certificate("test",
+				gen.SetCertificateIssuanceAttempts(new(10)),
+			),
+			secret: secret(certWithNotAfter(now.Add(time.Hour))),
+			policy: policy,
+		},
+		"no violation when the policy is invalid": {
+			certificate: gen.Certificate("test",
+				gen.SetCertificateLastFailureTime(metav1.NewTime(now)),
+				gen.SetCertificateIssuanceAttempts(new(10)),
+			),
+			secret: secret(certWithNotAfter(now.Add(time.Hour))),
+			policy: retry.Policy{Minimum: 0, Maximum: retry.DefaultMaximum},
+		},
+		"no violation when the secret is missing": {
+			certificate: gen.Certificate("test",
+				gen.SetCertificateLastFailureTime(metav1.NewTime(now)),
+				gen.SetCertificateIssuanceAttempts(new(10)),
+			),
+			policy: policy,
+		},
+		"no violation when the certificate cannot be decoded": {
+			certificate: gen.Certificate("test",
+				gen.SetCertificateLastFailureTime(metav1.NewTime(now)),
+				gen.SetCertificateIssuanceAttempts(new(10)),
+			),
+			secret: secret([]byte("not a certificate")),
+			policy: policy,
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			gotReason, gotMessage, gotViolation := CurrentCertificateRetryExhausted(clock, test.policy)(Input{
+				Certificate: test.certificate,
+				Secret:      test.secret,
+			})
+			assert.Equal(t, test.wantReason, gotReason)
+			assert.Equal(t, test.wantMessage, gotMessage)
+			assert.Equal(t, test.wantViolation, gotViolation)
+		})
+	}
+}
+
+func Test_NewReadinessPolicyChainWithRetry_ExpiredBeforeRetryExhausted(t *testing.T) {
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	clock := fakeclock.NewFakeClock(now)
+	privKey := testcrypto.MustCreatePEMPrivateKey(t)
+
+	crt := gen.Certificate("test",
+		gen.SetCertificateSecretName("something"),
+		gen.SetCertificateCommonName("example.com"),
+		gen.SetCertificateIssuer(cmmeta.IssuerReference{
+			Name:  "testissuer",
+			Kind:  "IssuerKind",
+			Group: "group.example.com",
+		}),
+		gen.SetCertificateLastFailureTime(metav1.NewTime(now)),
+		gen.SetCertificateIssuanceAttempts(new(100)),
+	)
+	secret := gen.Secret("something",
+		gen.SetSecretAnnotations(map[string]string{
+			cmapi.IssuerNameAnnotationKey:  "testissuer",
+			cmapi.IssuerKindAnnotationKey:  "IssuerKind",
+			cmapi.IssuerGroupAnnotationKey: "group.example.com",
+		}),
+		gen.SetSecretData(map[string][]byte{
+			corev1.TLSPrivateKeyKey: privKey,
+			corev1.TLSCertKey: testcrypto.MustCreateCertWithNotBeforeAfter(t, privKey,
+				gen.Certificate("something", gen.SetCertificateCommonName("example.com")),
+				now.Add(-3*time.Hour), now.Add(-time.Hour),
+			),
+		}),
+	)
+
+	chain := NewReadinessPolicyChainWithRetry(clock, retry.Policy{
+		Minimum: retry.DefaultMinimum,
+		Maximum: retry.DefaultMaximum,
+	})
+	reason, _, violationFound := chain.Evaluate(Input{
+		Certificate: crt,
+		Secret:      secret,
+	})
+	assert.True(t, violationFound)
+	assert.Equal(t, Expired, reason, "an already expired certificate must keep reporting Expired")
 }

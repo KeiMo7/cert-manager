@@ -39,6 +39,7 @@ import (
 
 	internalcertificates "github.com/cert-manager/cert-manager/internal/controller/certificates"
 	"github.com/cert-manager/cert-manager/internal/controller/certificates/policies"
+	"github.com/cert-manager/cert-manager/internal/controller/certificates/retry"
 	"github.com/cert-manager/cert-manager/internal/controller/feature"
 	internalinformers "github.com/cert-manager/cert-manager/internal/informers"
 	acmeutil "github.com/cert-manager/cert-manager/pkg/acme"
@@ -94,6 +95,11 @@ type controller struct {
 	helper             issuer.Helper
 	clock              clock.Clock
 	scheduledWorkQueue scheduler.ScheduledWorkQueue[types.NamespacedName]
+
+	// expiryWorkQueue re-reconciles a Certificate shortly after the expiry of
+	// the certificate currently stored in its Secret. Without it, a Certificate
+	// could stay Ready=True past expiry until some unrelated event arrived.
+	expiryWorkQueue scheduler.ScheduledWorkQueue[types.NamespacedName]
 }
 
 // readyConditionFunc is custom function type that builds certificate's Ready condition
@@ -188,6 +194,7 @@ func NewController(
 		fieldManager:          ctx.FieldManager,
 		clock:                 ctx.Clock,
 		scheduledWorkQueue:    scheduler.NewScheduledWorkQueue(ctx.Clock, queue.Add),
+		expiryWorkQueue:       scheduler.NewScheduledWorkQueue(ctx.Clock, queue.Add),
 	}, queue, mustSync, nil
 }
 
@@ -217,8 +224,23 @@ func (c *controller) ProcessItem(ctx context.Context, key types.NamespacedName) 
 	condition := c.policyEvaluator(c.policyChain, input)
 	oldCrt := crt
 	crt = crt.DeepCopy()
+
+	// True when the Certificate is entering the RetryExhausted state. The
+	// Warning is emitted only after the status write succeeds, so a conflict
+	// returned to the workqueue does not produce a duplicate event.
+	enteringRetryExhausted := condition.Status == cmmeta.ConditionFalse &&
+		condition.Reason == policies.RetryExhausted &&
+		func() bool {
+			oldReady := apiutil.GetCertificateCondition(oldCrt, cmapi.CertificateConditionReady)
+			return oldReady == nil || oldReady.Status != cmmeta.ConditionFalse || oldReady.Reason != policies.RetryExhausted
+		}()
+
 	apiutil.SetCertificateCondition(crt, crt.Generation, condition.Type, condition.Status, condition.Reason, condition.Message)
 
+	// notAfter is the expiry of the certificate found in the Secret. It stays
+	// nil when the Secret or its certificate is missing, so that status fields
+	// are cleared and the expiry check is forgotten.
+	var notAfter *time.Time
 	switch {
 	case input.Secret != nil && input.Secret.Data != nil:
 		x509cert, err := pki.DecodeX509CertificateBytes(input.Secret.Data[corev1.TLSCertKey])
@@ -232,7 +254,8 @@ func (c *controller) ProcessItem(ctx context.Context, key types.NamespacedName) 
 		}
 
 		notBefore := metav1.NewTime(x509cert.NotBefore)
-		notAfter := metav1.NewTime(x509cert.NotAfter)
+		notAfterTime := metav1.NewTime(x509cert.NotAfter)
+		notAfter = &x509cert.NotAfter
 
 		var renewalTime *metav1.Time
 		renewalTime = c.useARIForRenewal(ctx, crt, x509cert, input.Secret, key)
@@ -260,7 +283,7 @@ func (c *controller) ProcessItem(ctx context.Context, key types.NamespacedName) 
 
 		// update Certificate's Status
 		crt.Status.NotBefore = &notBefore
-		crt.Status.NotAfter = &notAfter
+		crt.Status.NotAfter = &notAfterTime
 		crt.Status.RenewalTime = renewalTime
 
 	default:
@@ -269,6 +292,9 @@ func (c *controller) ProcessItem(ctx context.Context, key types.NamespacedName) 
 		crt.Status.NotBefore = nil
 		crt.Status.RenewalTime = nil
 	}
+
+	c.scheduleExpiryCheck(key, crt, notAfter)
+
 	if !apiequality.Semantic.DeepEqual(oldCrt.Status, crt.Status) {
 		// klog.SafePtr prevents a nil *metav1.Time from reaching the logger's
 		// Stringer call, which would panic in the promoted time.Time.String
@@ -276,9 +302,50 @@ func (c *controller) ProcessItem(ctx context.Context, key types.NamespacedName) 
 		log.V(logf.DebugLevel).Info("updating status fields", "notAfter",
 			klog.SafePtr(crt.Status.NotAfter), "notBefore", klog.SafePtr(crt.Status.NotBefore), "renewalTime",
 			klog.SafePtr(crt.Status.RenewalTime))
-		return c.updateOrApplyStatus(ctx, crt)
+		if err := c.updateOrApplyStatus(ctx, crt); err != nil {
+			return err
+		}
 	}
+
+	if enteringRetryExhausted {
+		log.V(logf.InfoLevel).WithValues(
+			"certificate", klog.KObj(crt),
+		).Info("failed issuance cannot be retried before the certificate expires")
+		c.recorder.Event(crt, corev1.EventTypeWarning, policies.RetryExhausted, condition.Message)
+	}
+
 	return nil
+}
+
+// scheduleExpiryCheck arranges for the Certificate to be reconciled just after
+// the certificate in its Secret expires, so that the Ready condition changes
+// from True (or RetryExhausted) to Expired even when no other event arrives.
+//
+// When the Secret has no certificate, any pending expiry check is forgotten.
+func (c *controller) scheduleExpiryCheck(key types.NamespacedName, crt *cmapi.Certificate, notAfter *time.Time) {
+	if notAfter == nil {
+		c.expiryWorkQueue.Forget(key)
+		return
+	}
+
+	now := c.clock.Now()
+	if now.After(*notAfter) {
+		// The certificate has already expired. The Ready condition was just
+		// computed as Expired, so no further expiry check is needed. If it was
+		// not, re-check soon instead of leaving a stale condition in place.
+		if cond := apiutil.GetCertificateCondition(crt, cmapi.CertificateConditionReady); cond != nil &&
+			cond.Status == cmmeta.ConditionTrue {
+			c.expiryWorkQueue.Add(key, time.Second)
+			return
+		}
+		c.expiryWorkQueue.Forget(key)
+		return
+	}
+
+	// One second after expiry is enough to make the Expired check fire; the
+	// equality boundary in CurrentCertificateHasExpired would otherwise make
+	// the outcome depend on timer granularity.
+	c.expiryWorkQueue.Add(key, notAfter.Sub(now)+time.Second)
 }
 
 func (c *controller) computeNextCheck(now time.Time, retryAfter time.Duration) time.Time {
@@ -518,7 +585,10 @@ func (c *controllerWrapper) Register(ctx *controllerpkg.Context) (workqueue.Type
 
 	ctrl, queue, mustSync, err := NewController(log,
 		ctx,
-		policies.NewReadinessPolicyChain(ctx.Clock),
+		policies.NewReadinessPolicyChainWithRetry(ctx.Clock, retry.Policy{
+			Minimum: ctx.CertificateOptions.CertificateRequestMinimumBackoffDuration,
+			Maximum: ctx.CertificateOptions.CertificateRequestMaximumBackoffDuration,
+		}),
 		pki.RenewalTime,
 		BuildReadyConditionFromChain,
 	)

@@ -27,6 +27,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -35,6 +36,7 @@ import (
 	fakeclock "k8s.io/utils/clock/testing"
 
 	"github.com/cert-manager/cert-manager/internal/controller/feature"
+	apiutil "github.com/cert-manager/cert-manager/pkg/api/util"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	"github.com/cert-manager/cert-manager/pkg/controller/certificates/issuing/internal"
@@ -2166,4 +2168,182 @@ func mustSerializeApplyStatus(t *testing.T, crt *cmapi.Certificate, status cmapi
 	})
 	require.NoError(t, err)
 	return data
+}
+
+// TestIssuingController_RepeatedFailureCountsOnce checks that observing the
+// same failed CertificateRequest again does not bump failedIssuanceAttempts a
+// second time. The second observation is recognised as belonging to the
+// previous issuance via the Issuing condition's lastTransitionTime.
+func TestIssuingController_RepeatedFailureCountsOnce(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, feature.ServerSideApply, false)
+
+	fixture := failedIssuanceFixture(t)
+	fixedClock.SetTime(fixedClockStart)
+
+	b := &testpkg.Builder{
+		T:                  t,
+		Clock:              fixedClock,
+		CertManagerObjects: []runtime.Object{fixture.issuingCert, fixture.failedRequest},
+		KubeObjects:        []runtime.Object{fixture.nextPrivateKeySecret},
+	}
+	b.InitWithRESTConfig()
+	defer b.Stop()
+
+	w := controllerWrapper{}
+	_, _, err := w.Register(b.Context)
+	require.NoError(t, err)
+	w.controller.localTemporarySigner = testLocalTemporarySignerFn(fixture.bundle.LocalTemporaryCertificateBytes)
+
+	b.Start()
+
+	key := types.NamespacedName{
+		Namespace: fixture.bundle.Certificate.Namespace,
+		Name:      fixture.bundle.Certificate.Name,
+	}
+
+	// First sync records the failure.
+	require.NoError(t, w.controller.ProcessItem(t.Context(), key))
+	b.Sync()
+
+	cached, err := b.SharedInformerFactory.Certmanager().V1().Certificates().
+		Lister().Certificates(key.Namespace).Get(key.Name)
+	require.NoError(t, err)
+	require.NotNil(t, cached.Status.FailedIssuanceAttempts)
+	assert.Equal(t, 1, *cached.Status.FailedIssuanceAttempts)
+
+	// The CertificateRequest is re-observed without changing; the failure must
+	// not be counted again.
+	require.NoError(t, w.controller.ProcessItem(t.Context(), key))
+	b.Sync()
+
+	cached, err = b.SharedInformerFactory.Certmanager().V1().Certificates().
+		Lister().Certificates(key.Namespace).Get(key.Name)
+	require.NoError(t, err)
+	require.NotNil(t, cached.Status.FailedIssuanceAttempts)
+	assert.Equal(t, 1, *cached.Status.FailedIssuanceAttempts, "a repeated observation must not increment the attempt count")
+}
+
+// TestIssuingController_ConflictRetriesWithoutLosingCount checks that a
+// conflict on the status write is returned to the caller and that the retry,
+// performed with the unchanged cache, still records exactly one attempt.
+func TestIssuingController_ConflictRetriesWithoutLosingCount(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, feature.ServerSideApply, false)
+
+	fixture := failedIssuanceFixture(t)
+	fixedClock.SetTime(fixedClockStart)
+
+	b := &testpkg.Builder{
+		T:                  t,
+		Clock:              fixedClock,
+		CertManagerObjects: []runtime.Object{fixture.issuingCert, fixture.failedRequest},
+		KubeObjects:        []runtime.Object{fixture.nextPrivateKeySecret},
+	}
+	b.InitWithRESTConfig()
+	defer b.Stop()
+
+	w := controllerWrapper{}
+	_, _, err := w.Register(b.Context)
+	require.NoError(t, err)
+	w.controller.localTemporarySigner = testLocalTemporarySignerFn(fixture.bundle.LocalTemporaryCertificateBytes)
+
+	// First UpdateStatus conflicts; the second succeeds. The reactor only
+	// intercepts the first call, letting the fake client handle the retry.
+	var updates int
+	b.FakeCMClient().PrependReactor("update", "certificates", func(coretesting.Action) (bool, runtime.Object, error) {
+		updates++
+		if updates == 1 {
+			return true, nil, apierrors.NewConflict(cmapi.Resource("certificates"), fixture.bundle.Certificate.Name, errors.New("simulated conflict"))
+		}
+		return false, nil, nil
+	})
+
+	b.Start()
+
+	key := types.NamespacedName{
+		Namespace: fixture.bundle.Certificate.Namespace,
+		Name:      fixture.bundle.Certificate.Name,
+	}
+
+	// The conflict is returned to the queue rather than swallowed.
+	err = w.controller.ProcessItem(t.Context(), key)
+	require.Error(t, err)
+	assert.True(t, apierrors.IsConflict(err), "the conflict must be returned as an error for the workqueue, got %v", err)
+
+	// The workqueue retries; the second write succeeds.
+	require.NoError(t, w.controller.ProcessItem(t.Context(), key))
+	b.Sync()
+
+	assert.Equal(t, 2, updates, "the status write must be attempted twice")
+	cached, err := b.SharedInformerFactory.Certmanager().V1().Certificates().
+		Lister().Certificates(key.Namespace).Get(key.Name)
+	require.NoError(t, err)
+	require.NotNil(t, cached.Status.FailedIssuanceAttempts)
+	assert.Equal(t, 1, *cached.Status.FailedIssuanceAttempts, "a conflict must not lose or double the attempt count")
+	require.NotNil(t, cached.Status.LastFailureTime)
+	assert.Equal(t, fixedClockStart.UTC(), cached.Status.LastFailureTime.Time.UTC())
+}
+
+// TestIssuingController_SuccessClearsFailureState checks that a successful
+// issuance removes Issuing and clears failedIssuanceAttempts and
+// lastFailureTime.
+func TestIssuingController_SuccessClearsFailureState(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, feature.ServerSideApply, false)
+
+	fixture := failedIssuanceFixture(t)
+	fixedClock.SetTime(fixedClockStart)
+	metaFixedClockStart := metav1.NewTime(fixedClockStart)
+
+	b := &testpkg.Builder{
+		T:     t,
+		Clock: fixedClock,
+		CertManagerObjects: []runtime.Object{
+			gen.CertificateFrom(fixture.issuingCert,
+				gen.SetCertificateLastFailureTime(metaFixedClockStart),
+				gen.SetCertificateIssuanceAttempts(new(4)),
+			),
+			gen.CertificateRequestFrom(fixture.bundle.CertificateRequestReady,
+				gen.AddCertificateRequestAnnotations(map[string]string{
+					cmapi.CertificateRequestRevisionAnnotationKey: "2",
+				}),
+			),
+		},
+		KubeObjects: []runtime.Object{
+			fixture.nextPrivateKeySecret,
+			&corev1.Secret{
+				Namespace: fixture.bundle.Certificate.Namespace,
+				Name:      "output",
+				Labels:    map[string]string{},
+				Type:      corev1.SecretTypeTLS,
+			},
+		},
+	}
+	b.InitWithRESTConfig()
+	defer b.Stop()
+
+	w := controllerWrapper{}
+	_, _, err := w.Register(b.Context)
+	require.NoError(t, err)
+	w.controller.localTemporarySigner = testLocalTemporarySignerFn(fixture.bundle.LocalTemporaryCertificateBytes)
+	w.controller.secretsUpdateData = func(context.Context, *cmapi.Certificate, internal.SecretData) error {
+		return nil
+	}
+
+	b.Start()
+
+	key := types.NamespacedName{
+		Namespace: fixture.bundle.Certificate.Namespace,
+		Name:      fixture.bundle.Certificate.Name,
+	}
+	require.NoError(t, w.controller.ProcessItem(t.Context(), key))
+	b.Sync()
+
+	cached, err := b.SharedInformerFactory.Certmanager().V1().Certificates().
+		Lister().Certificates(key.Namespace).Get(key.Name)
+	require.NoError(t, err)
+	assert.Nil(t, cached.Status.FailedIssuanceAttempts, "a successful issuance must clear failedIssuanceAttempts")
+	assert.Nil(t, cached.Status.LastFailureTime, "a successful issuance must clear lastFailureTime")
+	assert.False(t, apiutil.CertificateHasCondition(cached, cmapi.CertificateCondition{
+		Type:   cmapi.CertificateConditionIssuing,
+		Status: cmmeta.ConditionTrue,
+	}), "Issuing must no longer be True after success")
 }

@@ -18,8 +18,8 @@ package trigger
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"math"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -30,10 +30,12 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
+	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
 
 	internalcertificates "github.com/cert-manager/cert-manager/internal/controller/certificates"
 	"github.com/cert-manager/cert-manager/internal/controller/certificates/policies"
+	"github.com/cert-manager/cert-manager/internal/controller/certificates/retry"
 	"github.com/cert-manager/cert-manager/internal/controller/feature"
 	internalinformers "github.com/cert-manager/cert-manager/internal/informers"
 	apiutil "github.com/cert-manager/cert-manager/pkg/api/util"
@@ -219,10 +221,18 @@ func (c *controller) ProcessItem(ctx context.Context, key types.NamespacedName) 
 
 	// Don't trigger issuance if we need to back off due to previous failures and Certificate's spec has not changed.
 	backoff, delay := shouldBackoffReissuingOnFailure(log, c.clock, input.Certificate, input.NextRevisionRequest, c.certificateRequestMinimumBackoffDuration, c.certificateRequestMaximumBackoffDuration)
-	if backoff {
-		nextIssuanceRetry := c.clock.Now().Add(delay)
-		message := fmt.Sprintf("Backing off from issuance due to previously failed issuance(s). Issuance will next be attempted at %v", nextIssuanceRetry)
-		log.V(logf.InfoLevel).Info(message)
+	if backoff && delay > 0 {
+		// The backoff branch only schedules another attempt: it must not write
+		// the Certificate's status or clear the renewal time, or the trigger
+		// would fight the readiness controller on every failed issuance.
+		nextIssuanceRetry := c.clock.Now().Add(delay).UTC()
+		message := fmt.Sprintf("Backing off from issuance due to previously failed issuance(s). Issuance will next be attempted at %s", nextIssuanceRetry.Format(time.RFC3339))
+		log.V(logf.InfoLevel).WithValues(
+			"certificate", klog.KObj(crt),
+			"attempt", logAttempts(input.Certificate),
+			"next_attempt", nextIssuanceRetry,
+			"delay", delay,
+		).Info(message)
 		c.scheduleRecheckOfCertificateIfRequired(log, key, delay)
 		return nil
 	}
@@ -338,46 +348,63 @@ func shouldBackoffReissuingOnFailure(log logr.Logger, c clock.Clock, crt *cmapi.
 		}
 	}
 
-	now := c.Now()
-	durationSinceFailure := now.Sub(crt.Status.LastFailureTime.Time)
-
 	if initialDelay <= 0 {
-		log.V(logf.InfoLevel).Info("initial backoff duration is less than or equal to zero, skipping backoff")
+		log.V(logf.WarnLevel).WithValues("certificate", klog.KObj(crt)).Info("initial backoff duration is less than or equal to zero, issuing immediately")
 		return false, 0
 	}
-	delay := initialDelay
+
+	policy := retry.Policy{
+		Minimum: initialDelay,
+		Maximum: maxDelay,
+	}
+
+	state := retry.State{
+		LastFailure: crt.Status.LastFailureTime.Time,
+	}
 	// It is possible that crt.Status.LastFailureTime != nil &&
 	// crt.Status.FailedIssuanceAttempts == nil (in case of the Certificate having
 	// failed for an installation of cert-manager before the issuance
-	// attempts were introduced). In such case delay = initialDelay.
+	// attempts were introduced). A nil pointer is treated as a single attempt;
+	// retry.State already treats attempts below one the same way.
 	if crt.Status.FailedIssuanceAttempts != nil {
-		if *crt.Status.FailedIssuanceAttempts <= 0 {
-			// FailedIssuanceAttempts <= 0 can only arise from a manual kubectl patch;
-			// treat it the same as nil (use initialDelay).
-			delay = initialDelay
+		state.Attempts = retry.AttemptsFromInt(*crt.Status.FailedIssuanceAttempts)
+	}
+
+	decision, err := policy.Decide(c.Now(), state)
+	if err != nil {
+		// An invalid policy must never block issuance: log a warning and try
+		// now. errors.Is keeps this robust if Decide grows new error kinds.
+		if errors.Is(err, retry.ErrInvalidPolicy) {
+			log.V(logf.WarnLevel).Info("invalid backoff policy, issuing immediately", "error", err)
 		} else {
-			computed := initialDelay * time.Duration(math.Pow(2, float64(*crt.Status.FailedIssuanceAttempts-1)))
-			if computed < initialDelay || computed > maxDelay {
-				delay = maxDelay
-			} else {
-				delay = computed
-			}
+			log.V(logf.WarnLevel).Info("could not compute issuance backoff, issuing immediately", "error", err)
 		}
-	}
-
-	// Ensure that minimum returned delay is initialDelay that is configured by the operator.
-	// This is here to guard against an edge case where the delay duration got messed
-	// up as a result of maths misuse in the previous calculations
-	if delay < initialDelay {
-		delay = initialDelay
-	}
-
-	if durationSinceFailure >= delay {
-		log.V(logf.ExtendedInfoLevel).WithValues("since_failure", durationSinceFailure).Info("Certificate has been in failure state long enough, no need to back off")
 		return false, 0
 	}
 
-	return true, delay - durationSinceFailure
+	log.V(logf.ExtendedInfoLevel).WithValues(
+		"certificate", klog.KObj(crt),
+		"attempt", state.Attempts,
+		"next_attempt", decision.NextAttempt,
+		"delay", decision.Delay,
+	).Info("computed issuance backoff")
+
+	if !decision.Waiting {
+		log.V(logf.ExtendedInfoLevel).Info("Certificate has been in failure state long enough, no need to back off")
+		return false, 0
+	}
+
+	return true, decision.Wait
+}
+
+// logAttempts renders the attempt count used for logging, treating an unset
+// counter as the single attempt the backoff calculation would use. It never
+// touches Secret data.
+func logAttempts(crt *cmapi.Certificate) int32 {
+	if crt.Status.FailedIssuanceAttempts == nil {
+		return 1
+	}
+	return retry.AttemptsFromInt(*crt.Status.FailedIssuanceAttempts)
 }
 
 // scheduleRecheckOfCertificateIfRequired will schedule the resource with the
